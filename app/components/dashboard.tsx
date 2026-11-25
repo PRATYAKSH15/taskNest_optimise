@@ -3,10 +3,12 @@
 import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { taskFormSchema } from "@/app/modules/tasks/task.schemas";
+import { NotificationBell, type AppNotification } from "./notification-bell";
+import { Toaster, type ToastMessage, type ToastTone } from "./toaster";
 import type {
   DashboardTask,
   DashboardTaskFilter,
@@ -15,6 +17,85 @@ import type {
 } from "./dashboard.types";
 
 type ApiError = { error?: string };
+
+function toDateTimeLocalValue(iso: string | null): string {
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function fromDateTimeLocalValue(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const date = new Date(trimmed);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function formatDueAt(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: date.getFullYear() !== new Date().getFullYear() ? "numeric" : undefined,
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
+
+const REMINDER_WINDOW_MS = 15 * 60 * 1000;
+const MAX_TIMER_DELAY_MS = 60 * 60 * 1000;
+const MAX_INBOX_NOTIFICATIONS = 40;
+let toastSequence = 0;
+
+function getNotificationsStorageKey(userId: string): string {
+  return `tasknest_notifications_${userId}`;
+}
+
+function loadStoredNotifications(userId: string): AppNotification[] {
+  try {
+    const raw = window.localStorage.getItem(getNotificationsStorageKey(userId));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (item): item is AppNotification =>
+        Boolean(item) &&
+        typeof item === "object" &&
+        typeof (item as AppNotification).id === "string" &&
+        typeof (item as AppNotification).title === "string" &&
+        typeof (item as AppNotification).createdAtMs === "number" &&
+        typeof (item as AppNotification).read === "boolean",
+    );
+  } catch {
+    return [];
+  }
+}
+
+function getDueState(task: DashboardTask, nowMs: number): "none" | "upcoming" | "soon" | "overdue" {
+  if (!task.dueAt) return "none";
+  const dueTime = new Date(task.dueAt).getTime();
+  if (Number.isNaN(dueTime)) return "none";
+  if (task.status === "done") return "upcoming";
+  const remainingMs = dueTime - nowMs;
+  if (remainingMs <= 0) return "overdue";
+  if (remainingMs <= REMINDER_WINDOW_MS) return "soon";
+  return "upcoming";
+}
+
+function formatDueBadge(task: DashboardTask, nowMs: number): string {
+  if (!task.dueAt) return "";
+  const formatted = formatDueAt(task.dueAt);
+  const state = getDueState(task, nowMs);
+  if (state === "overdue") return `Overdue · ${formatted}`;
+  if (state === "soon") {
+    const minsLeft = Math.max(1, Math.ceil((new Date(task.dueAt).getTime() - nowMs) / 60000));
+    return `Due in ${minsLeft}m · ${formatted}`;
+  }
+  return `Due ${formatted}`;
+}
 
 export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
   const router = useRouter();
@@ -27,6 +108,72 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
   const [pageError, setPageError] = useState("");
   const [isTaskDialogOpen, setIsTaskDialogOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<DashboardTask | null>(null);
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [aiSearchState, setAiSearchState] = useState<{
+    query: string;
+    answer: string;
+    matchingIds: string[];
+  } | null>(null);
+  const [isAiSearching, setIsAiSearching] = useState(false);
+  const [aiSearchError, setAiSearchError] = useState("");
+  const remindedKeysRef = useRef<Set<string>>(new Set());
+  const overdueKeysRef = useRef<Set<string>>(new Set());
+  const aiAbortRef = useRef<AbortController | null>(null);
+
+  const dismissToast = useCallback((id: string) => {
+    setToasts((current) => current.filter((item) => item.id !== id));
+  }, []);
+
+  const pushToast = useCallback(
+    (
+      tone: ToastTone,
+      title: string,
+      description?: string,
+      options?: { recordInInbox?: boolean; dedupeKey?: string },
+    ) => {
+      const id = `toast-${++toastSequence}`;
+      const durationMs = tone === "overdue" || tone === "reminder" || tone === "error" ? 7000 : 4200;
+      setToasts((current) => [...current.slice(-3), { id, tone, title, description, durationMs }]);
+
+      if (options?.recordInInbox !== false) {
+        setNotifications((current) => {
+          if (
+            options?.dedupeKey &&
+            current.some((item) => item.dedupeKey === options.dedupeKey)
+          ) {
+            return current;
+          }
+          const entry: AppNotification = {
+            id: `notif-${++toastSequence}-${nowMs}`,
+            tone,
+            title,
+            description,
+            createdAtMs: nowMs,
+            read: false,
+            dedupeKey: options?.dedupeKey,
+          };
+          return [entry, ...current].slice(0, MAX_INBOX_NOTIFICATIONS);
+        });
+      }
+    },
+    [nowMs],
+  );
+
+  const markNotificationRead = useCallback((id: string) => {
+    setNotifications((current) =>
+      current.map((item) => (item.id === id ? { ...item, read: true } : item)),
+    );
+  }, []);
+
+  const markAllNotificationsRead = useCallback(() => {
+    setNotifications((current) => current.map((item) => ({ ...item, read: true })));
+  }, []);
+
+  const clearAllNotifications = useCallback(() => {
+    setNotifications([]);
+  }, []);
   const {
     register,
     handleSubmit,
@@ -34,7 +181,7 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
     formState: { errors },
   } = useForm<DashboardTaskFormValues>({
     resolver: zodResolver(taskFormSchema),
-    defaultValues: { title: "", description: "", severity: "medium" },
+    defaultValues: { title: "", description: "", severity: "medium", dueAt: "" },
   });
 
   useEffect(() => {
@@ -53,6 +200,15 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
           return;
         }
         if (!response.ok) throw new Error(data.error ?? "Could not load your tasks.");
+        const storedNotifications = loadStoredNotifications(user.id);
+        for (const item of storedNotifications) {
+          if (item.dedupeKey?.startsWith("overdue:")) {
+            overdueKeysRef.current.add(item.dedupeKey.slice("overdue:".length));
+          } else if (item.dedupeKey?.startsWith("reminder:")) {
+            remindedKeysRef.current.add(item.dedupeKey.slice("reminder:".length));
+          }
+        }
+        setNotifications(storedNotifications);
         setTasks(data.tasks ?? []);
       } catch (error) {
         if (controller.signal.aborted) return;
@@ -64,28 +220,235 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
 
     void loadTasks();
     return () => controller.abort();
-  }, [router]);
+  }, [router, user.id]);
+
+  useEffect(() => {
+    if (isLoading) return;
+    try {
+      window.localStorage.setItem(
+        getNotificationsStorageKey(user.id),
+        JSON.stringify(notifications),
+      );
+    } catch {
+      // Ignore storage quota or privacy-mode errors.
+    }
+  }, [isLoading, notifications, user.id]);
+
+  useEffect(() => {
+    const intervalId = setInterval(() => setNowMs(Date.now()), 15000);
+
+    let nextBoundaryDelay = Number.POSITIVE_INFINITY;
+    for (const task of tasks) {
+      if (task.status !== "todo" || !task.dueAt) continue;
+      const dueTime = new Date(task.dueAt).getTime();
+      if (Number.isNaN(dueTime)) continue;
+      const reminderAt = dueTime - REMINDER_WINDOW_MS;
+      for (const boundary of [reminderAt, dueTime]) {
+        const delay = boundary - nowMs;
+        if (delay > 0 && delay < nextBoundaryDelay) {
+          nextBoundaryDelay = delay;
+        }
+      }
+    }
+
+    const boundaryTimer =
+      nextBoundaryDelay <= MAX_TIMER_DELAY_MS
+        ? setTimeout(() => setNowMs(Date.now()), nextBoundaryDelay + 50)
+        : undefined;
+
+    return () => {
+      clearInterval(intervalId);
+      if (boundaryTimer) clearTimeout(boundaryTimer);
+    };
+  }, [tasks, nowMs]);
+
+  useEffect(() => {
+    if (isLoading) return;
+
+    const activeKeys = new Set(
+      tasks
+        .filter((task) => task.status === "todo" && task.dueAt)
+        .map((task) => `${task.id}:${task.dueAt}`),
+    );
+    remindedKeysRef.current.forEach((key) => {
+      if (!activeKeys.has(key)) remindedKeysRef.current.delete(key);
+    });
+    overdueKeysRef.current.forEach((key) => {
+      if (!activeKeys.has(key)) overdueKeysRef.current.delete(key);
+    });
+
+    for (const task of tasks) {
+      if (task.status !== "todo" || !task.dueAt) continue;
+      const dueTime = new Date(task.dueAt).getTime();
+      if (Number.isNaN(dueTime)) continue;
+      const key = `${task.id}:${task.dueAt}`;
+      const remainingMs = dueTime - nowMs;
+
+      if (remainingMs <= 0) {
+        if (!overdueKeysRef.current.has(key)) {
+          overdueKeysRef.current.add(key);
+          pushToast(
+            "overdue",
+            `Overdue: ${task.title}`,
+            `Deadline passed (${formatDueAt(task.dueAt)}).`,
+            { dedupeKey: `overdue:${key}` },
+          );
+        }
+      } else if (remainingMs <= REMINDER_WINDOW_MS && !remindedKeysRef.current.has(key)) {
+        remindedKeysRef.current.add(key);
+        const minsLeft = Math.max(1, Math.ceil(remainingMs / 60000));
+        pushToast(
+          "reminder",
+          `Reminder: ${task.title}`,
+          `${minsLeft} minute${minsLeft === 1 ? "" : "s"} left (${formatDueAt(task.dueAt)}).`,
+          { dedupeKey: `reminder:${key}` },
+        );
+      }
+    }
+  }, [isLoading, nowMs, pushToast, tasks]);
 
   const todoTasks = useMemo(() => tasks.filter((task) => task.status === "todo"), [tasks]);
   const doneTasks = useMemo(() => tasks.filter((task) => task.status === "done"), [tasks]);
+
+  const clearSearch = useCallback(() => {
+    aiAbortRef.current?.abort();
+    aiAbortRef.current = null;
+    setSearchQuery("");
+    setAiSearchState(null);
+    setAiSearchError("");
+    setIsAiSearching(false);
+  }, []);
+
+  const runAiSearch = useCallback(
+    async (rawQuery: string) => {
+      const trimmed = rawQuery.trim();
+      if (!trimmed) {
+        clearSearch();
+        return;
+      }
+
+      aiAbortRef.current?.abort();
+      const controller = new AbortController();
+      aiAbortRef.current = controller;
+      setIsAiSearching(true);
+      setAiSearchError("");
+      setActiveFilter("all");
+
+      try {
+        const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        const response = await fetch("/api/ai/search-tasks", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: trimmed, timeZone }),
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]),
+        });
+        const data = (await response.json()) as {
+          answer?: string;
+          matchingTaskIds?: string[];
+          error?: string;
+        };
+
+        if (response.status === 401) {
+          router.replace("/sign-in");
+          return;
+        }
+        if (!response.ok || !data.answer || !Array.isArray(data.matchingTaskIds)) {
+          throw new Error(data.error ?? "Could not search your tasks with AI.");
+        }
+
+        setAiSearchState({
+          query: trimmed,
+          answer: data.answer,
+          matchingIds: data.matchingTaskIds,
+        });
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        const message =
+          error instanceof Error ? error.message : "Could not complete AI search.";
+        setAiSearchError(message);
+        setAiSearchState(null);
+      } finally {
+        if (!controller.signal.aborted) {
+          setIsAiSearching(false);
+        }
+      }
+    },
+    [clearSearch, router],
+  );
+
+  useEffect(() => {
+    return () => {
+      aiAbortRef.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    const trimmed = searchQuery.trim();
+    if (!trimmed || trimmed.split(/\s+/).length < 2) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      void runAiSearch(trimmed);
+    }, 650);
+    return () => clearTimeout(timer);
+  }, [runAiSearch, searchQuery]);
+
+  function handleSearchChange(nextValue: string) {
+    setSearchQuery(nextValue);
+    const trimmed = nextValue.trim();
+    if (!trimmed) {
+      aiAbortRef.current?.abort();
+      aiAbortRef.current = null;
+      setAiSearchState(null);
+      setAiSearchError("");
+      setIsAiSearching(false);
+      return;
+    }
+
+    if (trimmed.split(/\s+/).length < 2) {
+      aiAbortRef.current?.abort();
+      aiAbortRef.current = null;
+      setIsAiSearching(false);
+      setAiSearchError("");
+    }
+  }
+
+  const trimmedQuery = searchQuery.trim();
+  const isAiResultActive = Boolean(aiSearchState && aiSearchState.query === trimmedQuery);
+
   const visibleTasks = useMemo(() => {
-    const query = searchQuery.trim().toLowerCase();
+    if (isAiResultActive && aiSearchState) {
+      const idSet = new Set(aiSearchState.matchingIds);
+      return tasks.filter(
+        (task) => idSet.has(task.id) && (activeFilter === "all" || task.status === activeFilter),
+      );
+    }
+
+    const query = trimmedQuery.toLowerCase();
     return tasks.filter((task) => {
       const matchesFilter = activeFilter === "all" || task.status === activeFilter;
-      const matchesSearch = !query || `${task.title} ${task.description ?? ""}`.toLowerCase().includes(query);
+      const dueText = task.dueAt ? formatDueAt(task.dueAt) : "";
+      const matchesSearch =
+        !query || `${task.title} ${task.description ?? ""} ${dueText}`.toLowerCase().includes(query);
       return matchesFilter && matchesSearch;
     });
-  }, [activeFilter, searchQuery, tasks]);
+  }, [activeFilter, aiSearchState, isAiResultActive, tasks, trimmedQuery]);
 
   function openCreateDialog() {
     setEditingTask(null);
-    reset({ title: "", description: "", severity: "medium" });
+    reset({ title: "", description: "", severity: "medium", dueAt: "" });
     setIsTaskDialogOpen(true);
   }
 
   function openEditDialog(task: DashboardTask) {
     setEditingTask(task);
-    reset({ title: task.title, description: task.description ?? "", severity: task.severity });
+    reset({
+      title: task.title,
+      description: task.description ?? "",
+      severity: task.severity,
+      dueAt: toDateTimeLocalValue(task.dueAt),
+    });
     setIsTaskDialogOpen(true);
   }
 
@@ -96,7 +459,12 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
       const response = await fetch(editingTask ? `/api/tasks/${editingTask.id}` : "/api/tasks", {
         method: editingTask ? "PATCH" : "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...values, title: values.title.trim(), description: values.description.trim() }),
+        body: JSON.stringify({
+          title: values.title.trim(),
+          description: values.description.trim(),
+          severity: values.severity,
+          dueAt: fromDateTimeLocalValue(values.dueAt),
+        }),
       });
       const data = (await response.json()) as { task?: DashboardTask; error?: string };
       if (!response.ok || !data.task) throw new Error(data.error ?? "Could not save this task.");
@@ -105,8 +473,15 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
         ? current.map((task) => task.id === data.task!.id ? data.task! : task)
         : [data.task!, ...current]);
       setIsTaskDialogOpen(false);
+      pushToast(
+        "success",
+        editingTask ? "Task updated" : "Task added",
+        data.task.dueAt ? `Due ${formatDueAt(data.task.dueAt)}` : data.task.title,
+      );
     } catch (error) {
-      setPageError(error instanceof Error ? error.message : "Could not save this task.");
+      const message = error instanceof Error ? error.message : "Could not save this task.";
+      setPageError(message);
+      pushToast("error", "Could not save task", message);
     } finally {
       setIsSaving(false);
     }
@@ -123,8 +498,15 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
       const data = (await response.json()) as { task?: DashboardTask; error?: string };
       if (!response.ok || !data.task) throw new Error(data.error ?? "Could not update this task.");
       setTasks((current) => current.map((item) => item.id === task.id ? data.task! : item));
+      pushToast(
+        nextStatus === "done" ? "success" : "info",
+        nextStatus === "done" ? "Task completed" : "Moved back to To do",
+        task.title,
+      );
     } catch (error) {
-      setPageError(error instanceof Error ? error.message : "Could not update this task.");
+      const message = error instanceof Error ? error.message : "Could not update this task.";
+      setPageError(message);
+      pushToast("error", "Could not update task", message);
     }
   }
 
@@ -135,8 +517,11 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
       const data = (await response.json()) as ApiError;
       if (!response.ok) throw new Error(data.error ?? "Could not delete this task.");
       setTasks((current) => current.filter((item) => item.id !== task.id));
+      pushToast("info", "Task deleted", task.title);
     } catch (error) {
-      setPageError(error instanceof Error ? error.message : "Could not delete this task.");
+      const message = error instanceof Error ? error.message : "Could not delete this task.";
+      setPageError(message);
+      pushToast("error", "Could not delete task", message);
     }
   }
 
@@ -173,9 +558,18 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
       <section className="dashboard-main">
         <header className="dashboard-topbar">
           <div className="dashboard-breadcrumb">Workspace <span>/</span> <strong>My tasks</strong></div>
-          <div className="dashboard-user">
-            <span className="dashboard-user-avatar">{user?.name.slice(0, 1).toUpperCase() ?? "•"}</span>
-            <span>{user?.name ?? "Loading…"}</span>
+          <div className="dashboard-topbar-actions">
+            <NotificationBell
+              notifications={notifications}
+              nowMs={nowMs}
+              onClearAll={clearAllNotifications}
+              onMarkAllRead={markAllNotificationsRead}
+              onMarkRead={markNotificationRead}
+            />
+            <div className="dashboard-user">
+              <span className="dashboard-user-avatar">{user?.name.slice(0, 1).toUpperCase() ?? "•"}</span>
+              <span>{user?.name ?? "Loading…"}</span>
+            </div>
           </div>
         </header>
 
@@ -201,7 +595,40 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
           <section className="task-board" id="tasks">
             <div className="task-board-header">
               <div><h2>Your tasks</h2><p>Keep the next step in view.</p></div>
-              <label className="task-search"><span aria-hidden="true">⌕</span><input aria-label="Search tasks" onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search tasks" value={searchQuery} /></label>
+              <form
+                className="task-search-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void runAiSearch(searchQuery);
+                }}
+              >
+                <label className="task-search">
+                  <span aria-hidden="true">✦</span>
+                  <input
+                    aria-label="Ask AI or search tasks"
+                    onChange={(event) => handleSearchChange(event.target.value)}
+                    placeholder='Ask AI e.g. "What tasks are left for 26 November?" or search...'
+                    value={searchQuery}
+                  />
+                  {searchQuery && (
+                    <button
+                      aria-label="Clear search"
+                      className="task-search-clear"
+                      onClick={clearSearch}
+                      type="button"
+                    >
+                      ×
+                    </button>
+                  )}
+                </label>
+                <button
+                  className="task-search-submit"
+                  disabled={!trimmedQuery || isAiSearching}
+                  type="submit"
+                >
+                  {isAiSearching ? "Asking…" : "Ask AI"}
+                </button>
+              </form>
             </div>
             <div className="task-board-toolbar">
               <div className="task-filter-tabs" role="tablist" aria-label="Filter tasks">
@@ -215,16 +642,55 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
               <span className="task-sort-label">Sorted by newest</span>
             </div>
 
+            {(isAiSearching || isAiResultActive || aiSearchError) && (
+              <div
+                aria-live="polite"
+                className={`ai-search-banner ${aiSearchError ? "is-error" : ""}`}
+                role="status"
+              >
+                <span aria-hidden="true" className="ai-search-badge">✦</span>
+                <div className="ai-search-copy">
+                  {isAiSearching ? (
+                    <p>Searching your tasks for “{trimmedQuery}”…</p>
+                  ) : aiSearchError ? (
+                    <p>{aiSearchError} Showing keyword matches instead.</p>
+                  ) : aiSearchState ? (
+                    <>
+                      <strong>{aiSearchState.answer}</strong>
+                      <span>
+                        {visibleTasks.length} matching task{visibleTasks.length === 1 ? "" : "s"}
+                      </span>
+                    </>
+                  ) : null}
+                </div>
+                <button onClick={clearSearch} type="button">Clear</button>
+              </div>
+            )}
+
             <div className="task-list">
-              {isLoading ? <div className="task-empty"><span className="task-empty-icon">◌</span><strong>Loading your tasks…</strong></div> : visibleTasks.length ? visibleTasks.map((task) => (
+              {isLoading ? <div className="task-empty"><span className="task-empty-icon">◌</span><strong>Loading your tasks…</strong></div> : visibleTasks.length ? visibleTasks.map((task) => {
+                const dueState = getDueState(task, nowMs);
+                return (
                 <article className={`task-row-card ${task.status === "done" ? "is-complete" : ""}`} key={task.id}>
                   <button aria-label={task.status === "done" ? `Mark ${task.title} as to do` : `Mark ${task.title} complete`} className={`task-row-check ${task.status === "done" ? "is-checked" : ""}`} onClick={() => void toggleTask(task)} type="button">{task.status === "done" ? "✓" : ""}</button>
-                  <div className="task-row-copy"><h3>{task.title}</h3>{task.description && <p>{task.description}</p>}</div>
+                  <div className="task-row-copy">
+                    <h3>{task.title}</h3>
+                    {task.description && <p>{task.description}</p>}
+                    {task.dueAt && (
+                      <span className={`task-due ${dueState === "overdue" ? "is-overdue" : dueState === "soon" ? "is-soon" : ""}`}>
+                        <i aria-hidden="true">◷</i>
+                        {formatDueBadge(task, nowMs)}
+                      </span>
+                    )}
+                  </div>
                   <span className={`task-priority priority-${task.severity}`}><i />{task.severity}</span>
                   <div className="task-row-actions"><button aria-label={`Edit ${task.title}`} onClick={() => openEditDialog(task)} type="button">Edit</button><button aria-label={`Delete ${task.title}`} onClick={() => void deleteTask(task)} type="button">Delete</button></div>
                 </article>
-              )) : (
-                <div className="task-empty"><span className="task-empty-icon">✓</span><strong>{searchQuery ? "No matching tasks" : activeFilter === "done" ? "Nothing completed yet" : activeFilter === "todo" ? "You’re all caught up" : "Your list starts here"}</strong><p>{searchQuery ? "Try a different search." : "Add a task and make a little progress."}</p>{!searchQuery && <button onClick={openCreateDialog} type="button">Create your first task <span>→</span></button>}</div>
+                );
+              }) : isAiSearching ? (
+                <div className="task-empty"><span className="task-empty-icon">✦</span><strong>Finding matching tasks…</strong><p>Checking your task list and due dates.</p></div>
+              ) : (
+                <div className="task-empty"><span className="task-empty-icon">✓</span><strong>{searchQuery ? "No matching tasks" : activeFilter === "done" ? "Nothing completed yet" : activeFilter === "todo" ? "You’re all caught up" : "Your list starts here"}</strong><p>{searchQuery ? "Try a different question or clear the search." : "Add a task and make a little progress."}</p>{!searchQuery && <button onClick={openCreateDialog} type="button">Create your first task <span>→</span></button>}</div>
               )}
             </div>
           </section>
@@ -240,12 +706,16 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
             <form className="task-modal-form" onSubmit={handleSubmit(saveTask)}>
               <label className="task-modal-field"><span>Title</span><input autoFocus maxLength={200} placeholder="What needs doing?" {...register("title", { required: "Add a title for your task.", maxLength: { value: 200, message: "Keep the title under 200 characters." } })} />{errors.title && <small>{errors.title.message}</small>}</label>
               <label className="task-modal-field"><span>Description <em>Optional</em></span><textarea maxLength={2000} placeholder="Add a few details" rows={4} {...register("description")} /></label>
-              <label className="task-modal-field"><span>Priority</span><select {...register("severity", { required: true })}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>
+              <div className="task-modal-row">
+                <label className="task-modal-field"><span>Priority</span><select {...register("severity", { required: true })}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>
+                <label className="task-modal-field"><span>Complete by <em>Optional</em></span><input type="datetime-local" {...register("dueAt")} />{errors.dueAt && <small>{errors.dueAt.message}</small>}</label>
+              </div>
               <div className="task-modal-actions"><button className="task-modal-cancel" disabled={isSaving} onClick={() => setIsTaskDialogOpen(false)} type="button">Cancel</button><button className="task-modal-save" disabled={isSaving} type="submit">{isSaving ? "Saving…" : editingTask ? "Save changes" : "Add task"}</button></div>
             </form>
           </section>
         </div>
       )}
+      <Toaster onDismiss={dismissToast} toasts={toasts} />
     </main>
   );
 }

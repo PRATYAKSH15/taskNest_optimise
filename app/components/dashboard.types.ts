@@ -8,6 +8,7 @@ export interface DashboardTask {
   description: string | null;
   status: DashboardTaskStatus;
   severity: DashboardTaskSeverity;
+  dueAt: string | null;
   createdAt: string;
   updatedAt: string;
 }

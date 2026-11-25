@@ -27,7 +27,7 @@ export async function POST(request: Request) {
   const parsed = createTaskSchema.safeParse(body);
   if (!parsed.success) {
     return NextResponse.json(
-      { error: "Title and description are required; severity must be low, medium, or high." },
+      { error: "Title and description are required; severity must be low, medium, or high, and dueAt must be valid." },
       { status: 400 },
     );
   }

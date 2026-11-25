@@ -12,7 +12,7 @@ export type UpdateTaskInput = z.infer<typeof updateTaskSchema>;
 export type TaskFormValues = z.infer<typeof taskFormSchema>;
 
 export type TaskUpdateFields = Partial<
-  Pick<TaskRecord, "title" | "description" | "severity" | "status">
+  Pick<TaskRecord, "title" | "description" | "severity" | "status" | "dueAt">
 >;
 
 export type TaskErrorCode = "INVALID_INPUT";

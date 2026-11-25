@@ -28,6 +28,7 @@ export class TaskService {
       title: changes.title!,
       description: changes.description!,
       severity: changes.severity ?? "medium",
+      dueAt: changes.dueAt ? new Date(changes.dueAt) : null,
     });
   }
 
@@ -46,7 +47,11 @@ export class TaskService {
   ): Promise<TaskRecord | null> {
     const parsed = updateTaskSchema.safeParse(input);
     if (!parsed.success) throw new TaskError("INVALID_INPUT");
-    return this.tasks.updateForUser(userId, taskId, parsed.data);
+    const { dueAt, ...rest } = parsed.data;
+    return this.tasks.updateForUser(userId, taskId, {
+      ...rest,
+      ...(dueAt !== undefined ? { dueAt: dueAt ? new Date(dueAt) : null } : {}),
+    });
   }
 
   deleteTask(userId: string, taskId: string): Promise<boolean> {

@@ -1,0 +1,47 @@
+{
+  "type": "diff",
+  "version": "10",
+  "dialect": "postgres",
+  "id": "ef9d26aa-f440-452b-b8af-755a553c1a0a",
+  "prevIds": [
+    "e4c0a9b9-4e57-4410-9e9d-2b27b7765612"
+  ],
+  "footprints": [
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "tasks",
+        "due_at"
+      ],
+      "writes": [
+        "s|col|public.tasks.due_at",
+        "n|col|public.tasks.due_at",
+        "e|col|public.tasks.due_at"
+      ],
+      "reads": [
+        "n|tbl|public.tasks",
+        "n|sch|public"
+      ]
+    }
+  ],
+  "deltas": [
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "tasks",
+        "name": "due_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    }
+  ]
+}
