@@ -50,6 +50,23 @@ const MAX_TIMER_DELAY_MS = 60 * 60 * 1000;
 const MAX_INBOX_NOTIFICATIONS = 40;
 let toastSequence = 0;
 
+function pickSupportedAudioMimeType(): string | undefined {
+  if (typeof MediaRecorder === "undefined") return undefined;
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4",
+    "audio/ogg;codecs=opus",
+  ];
+  return candidates.find((type) => MediaRecorder.isTypeSupported(type));
+}
+
+function getAudioFilename(mimeType: string): string {
+  if (mimeType.includes("mp4")) return "voice-query.m4a";
+  if (mimeType.includes("ogg")) return "voice-query.ogg";
+  return "voice-query.webm";
+}
+
 function getNotificationsStorageKey(userId: string): string {
   return `tasknest_notifications_${userId}`;
 }
@@ -118,9 +135,14 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
   } | null>(null);
   const [isAiSearching, setIsAiSearching] = useState(false);
   const [aiSearchError, setAiSearchError] = useState("");
+  const [isRecordingVoice, setIsRecordingVoice] = useState(false);
+  const [isTranscribingVoice, setIsTranscribingVoice] = useState(false);
   const remindedKeysRef = useRef<Set<string>>(new Set());
   const overdueKeysRef = useRef<Set<string>>(new Set());
   const aiAbortRef = useRef<AbortController | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
 
   const dismissToast = useCallback((id: string) => {
     setToasts((current) => current.filter((item) => item.id !== id));
@@ -379,8 +401,136 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
   useEffect(() => {
     return () => {
       aiAbortRef.current?.abort();
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop();
+      }
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
     };
   }, []);
+
+  const stopMediaTracks = useCallback(() => {
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+  }, []);
+
+  const transcribeVoiceBlob = useCallback(
+    async (blob: Blob, mimeType: string) => {
+      setIsTranscribingVoice(true);
+      setAiSearchError("");
+      try {
+        const formData = new FormData();
+        formData.append("file", blob, getAudioFilename(mimeType));
+
+        const response = await fetch("/api/ai/transcribe", {
+          method: "POST",
+          body: formData,
+          signal: AbortSignal.timeout(20000),
+        });
+        const data = (await response.json()) as { text?: string; error?: string };
+
+        if (response.status === 401) {
+          router.replace("/sign-in");
+          return;
+        }
+        if (!response.ok || !data.text) {
+          throw new Error(data.error ?? "Could not understand the voice recording.");
+        }
+
+        setSearchQuery(data.text);
+        await runAiSearch(data.text);
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Could not transcribe voice input.";
+        pushToast("error", "Voice search failed", message, { recordInInbox: false });
+      } finally {
+        setIsTranscribingVoice(false);
+      }
+    },
+    [pushToast, router, runAiSearch],
+  );
+
+  async function toggleVoiceRecording() {
+    if (isRecordingVoice) {
+      const recorder = mediaRecorderRef.current;
+      if (recorder && recorder.state !== "inactive") {
+        recorder.stop();
+      } else {
+        stopMediaTracks();
+        setIsRecordingVoice(false);
+      }
+      return;
+    }
+
+    if (
+      typeof navigator === "undefined" ||
+      !navigator.mediaDevices?.getUserMedia ||
+      typeof MediaRecorder === "undefined"
+    ) {
+      pushToast(
+        "error",
+        "Voice input unsupported",
+        "Your browser does not support microphone recording.",
+        { recordInInbox: false },
+      );
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+
+      const mimeType = pickSupportedAudioMimeType();
+      const recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream);
+
+      audioChunksRef.current = [];
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        const resolvedMimeType = recorder.mimeType || mimeType || "audio/webm";
+        const chunks = audioChunksRef.current;
+        audioChunksRef.current = [];
+        mediaRecorderRef.current = null;
+        stopMediaTracks();
+        setIsRecordingVoice(false);
+
+        if (chunks.length === 0) return;
+        const audioBlob = new Blob(chunks, { type: resolvedMimeType });
+        if (audioBlob.size === 0) return;
+        void transcribeVoiceBlob(audioBlob, resolvedMimeType);
+      };
+
+      recorder.onerror = () => {
+        audioChunksRef.current = [];
+        mediaRecorderRef.current = null;
+        stopMediaTracks();
+        setIsRecordingVoice(false);
+        pushToast("error", "Recording error", "Could not record from your microphone.", {
+          recordInInbox: false,
+        });
+      };
+
+      recorder.start();
+      setIsRecordingVoice(true);
+    } catch {
+      stopMediaTracks();
+      setIsRecordingVoice(false);
+      pushToast(
+        "error",
+        "Microphone permission needed",
+        "Allow microphone access in your browser to use voice search.",
+        { recordInInbox: false },
+      );
+    }
+  }
 
   useEffect(() => {
     const trimmed = searchQuery.trim();
@@ -602,15 +752,22 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
                   void runAiSearch(searchQuery);
                 }}
               >
-                <label className="task-search">
+                <div className="task-search">
                   <span aria-hidden="true">✦</span>
                   <input
                     aria-label="Ask AI or search tasks"
+                    disabled={isTranscribingVoice}
                     onChange={(event) => handleSearchChange(event.target.value)}
-                    placeholder='Ask AI e.g. "What tasks are left for 26 November?" or search...'
+                    placeholder={
+                      isRecordingVoice
+                        ? "Listening… click mic to stop and search"
+                        : isTranscribingVoice
+                          ? "Transcribing your voice…"
+                          : 'Ask AI e.g. "What tasks are left for 26 November?" or search...'
+                    }
                     value={searchQuery}
                   />
-                  {searchQuery && (
+                  {searchQuery && !isRecordingVoice && (
                     <button
                       aria-label="Clear search"
                       className="task-search-clear"
@@ -620,13 +777,40 @@ export function Dashboard({ initialUser }: { initialUser: DashboardUser }) {
                       ×
                     </button>
                   )}
-                </label>
+                  <button
+                    aria-label={isRecordingVoice ? "Stop voice recording" : "Speak task search"}
+                    aria-pressed={isRecordingVoice}
+                    className={`task-voice-button ${isRecordingVoice ? "is-recording" : ""}`}
+                    disabled={isTranscribingVoice}
+                    onClick={() => void toggleVoiceRecording()}
+                    title={isRecordingVoice ? "Stop recording" : "Speak your question"}
+                    type="button"
+                  >
+                    <svg aria-hidden="true" fill="none" viewBox="0 0 20 20">
+                      <rect
+                        height="8.5"
+                        rx="2.25"
+                        stroke="currentColor"
+                        strokeWidth="1.5"
+                        width="4.5"
+                        x="7.75"
+                        y="2.75"
+                      />
+                      <path
+                        d="M5 9.75a5 5 0 0 0 10 0M10 14.75v2.5M7.5 17.25h5"
+                        stroke="currentColor"
+                        strokeLinecap="round"
+                        strokeWidth="1.5"
+                      />
+                    </svg>
+                  </button>
+                </div>
                 <button
                   className="task-search-submit"
-                  disabled={!trimmedQuery || isAiSearching}
+                  disabled={!trimmedQuery || isAiSearching || isRecordingVoice || isTranscribingVoice}
                   type="submit"
                 >
-                  {isAiSearching ? "Asking…" : "Ask AI"}
+                  {isTranscribingVoice ? "Listening…" : isAiSearching ? "Asking…" : "Ask AI"}
                 </button>
               </form>
             </div>

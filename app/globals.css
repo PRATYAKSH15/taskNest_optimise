@@ -1336,6 +1336,12 @@ a {
 .task-search>span { color:#b2724f; font-size:14px; line-height:1; }.task-search input { width:100%; min-width:0; border:0; outline:0; background:transparent; color:#2d4339; font:inherit; font-size:12px; }.task-search input::placeholder { color:#9ca8a1; }
 .task-search-clear { display:grid; width:20px; height:20px; flex:0 0 auto; place-items:center; border:0; border-radius:50%; background:#eef1eb; color:#65766d; cursor:pointer; font:inherit; font-size:14px; line-height:1; }
 .task-search-clear:hover { background:#e2e7de; color:#243a31; }
+.task-voice-button { display:grid; width:28px; height:28px; flex:0 0 auto; place-items:center; border:0; border-radius:8px; background:#f2f5ef; color:#486256; cursor:pointer; transition:background 140ms ease,color 140ms ease,box-shadow 140ms ease; }
+.task-voice-button svg { width:16px; height:16px; }
+.task-voice-button:hover:not(:disabled) { background:#e5ece2; color:#1f483b; }
+.task-voice-button:disabled { cursor:wait; opacity:.55; }
+.task-voice-button.is-recording { background:#fce9e2; color:#b84c37; box-shadow:0 0 0 3px rgba(184,76,55,.16); animation:voice-pulse 1.2s ease-in-out infinite; }
+@keyframes voice-pulse { 0%,100% { transform:scale(1); } 50% { transform:scale(1.06); } }
 .task-search-submit { height:40px; flex:0 0 auto; padding:0 14px; border:0; border-radius:10px; background:#214e42; color:#fffdf6; cursor:pointer; font:inherit; font-size:11px; font-weight:750; transition:background 140ms ease; }
 .task-search-submit:hover:not(:disabled) { background:#173d33; }
 .task-search-submit:disabled { cursor:default; opacity:.55; }
