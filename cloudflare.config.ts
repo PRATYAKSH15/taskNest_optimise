@@ -2,7 +2,7 @@ import { bindings, defineConfig, defineWorker } from "cf/config";
 
 export default defineConfig({
   worker: defineWorker({
-    name: "my-app",
+    name: "tasknest-optimise",
     entrypoint: "vinext/server/fetch-handler",
     compatibilityDate: "2026-11-24",
     compatibilityFlags: ["nodejs_compat", "nodejs_compat_populate_process_env"],
@@ -15,6 +15,7 @@ export default defineConfig({
       ASSETS: bindings.assets(),
       DATABASE_PROVIDER: bindings.text("neon"),
       DATABASE_URL: bindings.secret(),
+      GROQ_API_KEY: bindings.secret(),
     },
   }),
 });
